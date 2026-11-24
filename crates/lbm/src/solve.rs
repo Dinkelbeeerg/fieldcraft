@@ -407,6 +407,27 @@ pub fn solve_fluid_checkpointed(
     run_checkpointed(&setup, &mut flow, limits, Some(store))
 }
 
+/// Advance `steps` (at least 1) to a step whose wall forces are sampled, and return the forces of the step before
+/// it (`None` when no step came before: the very first step of a run). A wall's force near τ⁺ = ½ alternates step
+/// by step (the non-equilibrium stress at a bounce-back wall relaxes by 1 − ω → −1), so a sample is the mean of two
+/// consecutive steps (A. J. C. Ladd, J. Fluid Mech. 271:285–309, 1994).
+fn advance_to_force_sample(flow: &mut dyn Backend, steps: u64) -> Result<Option<Vec<[f64; 3]>>> {
+    if steps > 1 {
+        flow.advance(steps - 1)?;
+    }
+    let before = if flow.steps_done() > 0 { Some(flow.forces()?) } else { None };
+    flow.advance(1)?;
+    Ok(before)
+}
+
+/// The mean of the forces of two consecutive steps; the last step's alone when there is no step before it.
+fn two_step_forces(before: Option<Vec<[f64; 3]>>, last: Vec<[f64; 3]>) -> Vec<[f64; 3]> {
+    match before {
+        Some(b) if b.len() == last.len() => last.iter().zip(&b).map(|(l, p)| [0, 1, 2].map(|a| 0.5 * (l[a] + p[a]))).collect(),
+        _ => last,
+    }
+}
+
 fn frame(setup: &Setup, flow: &mut dyn Backend, step: u64, validity: &mut crate::validity::Sampler) -> Result<Frame> {
     let n = setup.grid.len();
     let mut velocity = Vec::new();
@@ -518,7 +539,7 @@ fn run_checkpointed(
     fieldcraft_model::progress::stage("Fluid steps", Some(total as f64), "");
     let mut monitor = Monitor::new(setup, flow)?;
     if let Some(m) = monitor.as_mut() {
-        m.sample_observed(setup, flow, 0, Some(&mut validity))?;
+        m.sample_observed(setup, flow, 0, Some(&mut validity), None)?;
     }
     let mut sound = true;
     let mut k = 0u64;
@@ -565,7 +586,10 @@ fn run_checkpointed(
         if let Some(period) = k.checked_div(checkpoint_every) {
             next = next.min((period + 1).saturating_mul(checkpoint_every));
         }
-        match (flow.advance(next - k), monitor.as_mut()) {
+        let force_sample = next.is_multiple_of(every) || next == total || monitor.as_ref().is_some_and(|m| m.samples_at(next));
+        let mut before = None;
+        let advanced = if force_sample { advance_to_force_sample(flow, next - k).map(|b| before = b) } else { flow.advance(next - k) };
+        match (advanced, monitor.as_mut()) {
             (Ok(()), _) => {}
             (Err(Error::Unstable(e)), Some(m)) => {
                 if store.is_some() {
@@ -593,9 +617,10 @@ fn run_checkpointed(
         if k.is_multiple_of(64) || k == total {
             fieldcraft_model::progress::count(k as f64);
         }
+        let sampled = if force_sample { Some(two_step_forces(before, flow.forces()?)) } else { None };
         if k.is_multiple_of(every) || k == total {
             history_times.push(k as f64 * setup.time_step);
-            for (h, f) in forces.iter_mut().zip(flow.forces()?) {
+            for (h, f) in forces.iter_mut().zip(sampled.iter().flatten()) {
                 h.push(f.map(|c| c * fs));
             }
             if !zones.is_empty() {
@@ -625,7 +650,7 @@ fn run_checkpointed(
         }
         if let Some(m) = monitor.as_mut()
             && m.samples_at(k)
-            && let Some(reason) = m.sample_observed(setup, flow, k, Some(&mut validity))?
+            && let Some(reason) = m.sample_observed(setup, flow, k, Some(&mut validity), sampled.as_deref())?
         {
             sound = reason != StopReason::Diverged;
             if sound && out_frames.last().is_some_and(|f| f.step != k) {
